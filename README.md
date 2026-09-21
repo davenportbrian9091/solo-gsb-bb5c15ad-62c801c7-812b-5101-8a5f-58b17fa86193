@@ -5,6 +5,10 @@
 且此前尚未发布的读数，并按 `(observed_at, source_id, seq)` 输出**确定顺序**的归并流。
 越过**已发布**水位线才到达的迟到读数不会改写历史，而是进入**隔离区**供查询。
 
+在发布之上，服务还提供**发布后告警**：按来源配置带滞回的连续阈值规则，
+只有确定发布的读数才会推进告警状态机（进入 / 持续 / 恢复），
+并提供当前告警查询与可分页的告警历史。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次
@@ -41,7 +45,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 22 个行为测试（需 pytest、httpx）
+pytest -q        # 运行 41 个行为测试（需 pytest、httpx）
 ```
 
 ## 语义说明
@@ -57,6 +61,25 @@ pytest -q        # 运行 22 个行为测试（需 pytest、httpx）
 6. **隔离（quarantine）**：读数到达时若 `observed_at < 已发布水位线`，它永远无法再进入已发布流，
    原样写入隔离区（记录当时的水位线），已发布历史不发生任何变化。
 7. 时间统一按 UTC 处理：接受 `...Z`、带偏移量（`+02:00`）或不带时区（按 UTC）的 ISO 8601 字符串。
+
+### 告警语义（发布后告警）
+
+8. **只有确定发布的读数推进告警**：告警状态机在每批发布发生后、于同一事务内，
+   按 `(observed_at, source_id, seq)` 顺序逐条消费**本批新发布**的读数；
+   缓冲中与已隔离的读数永远不会改变告警状态。
+9. **连续阈值 + 滞回**：规则按来源定义 `direction`（`above`/`below`）、进入阈值、恢复阈值
+   及各自连续次数。`above` 时 `value >= enter_threshold` 计一次越限、`value <= recover_threshold`
+   计一次恢复（`below` 方向相反）。恢复阈值必须严格位于进入阈值另一侧（滞回带），
+   避免读数在单一边界附近抖动时告警反复进出；落在滞回带内的读数会打断连续计数。
+10. **状态机**：`normal →（连续 enter_count 次越限）→ alerting →（连续 recover_count 次恢复）→ normal`。
+    转换写入历史（`entered` / `recovered` 事件），计数清零。当前查询另派生两个中间相位：
+    `entering`（越限计数累积中）与 `recovering`（恢复计数累积中，仍属活动告警）。
+11. **非数值读数**：`value` 不是 JSON 数字时（字符串、对象、null、bool），
+    该读数不参与比较，但会打断连续计数（清零），不产生状态转换。
+12. **规则创建即重放**：创建规则时会对该来源**已发布**的读数按时间线顺序重放一次，
+    使状态机与“规则从一开始就存在”完全一致；之后随新发布增量推进。
+13. **明确错误**：对未知来源建规则、滞回带方向/大小非法、连续次数 < 1、非法 direction
+    均返回 400；会话不存在返回 404；`rule_id` 冲突返回 409。
 
 ## 接口
 
@@ -102,12 +125,15 @@ curl -s -X POST localhost:8000/sessions/lab-1/readings \
   "published_total": 0,
   "buffered": 2,
   "all_sources_reported": true,
-  "published_watermark": null
+  "published_watermark": null,
+  "alerts_entered": 0,
+  "alerts_recovered": 0
 }
 ```
 
 字段：`received` 批内条数；`duplicates` 幂等重复条数；`quarantined` 本批被隔离条数；
-`published_now` 本批触发新发布的条数；`published_total` 会话累计已发布；`buffered` 仍在等待的条数。
+`published_now` 本批触发新发布的条数；`published_total` 会话累计已发布；`buffered` 仍在等待的条数；
+`alerts_entered` / `alerts_recovered` 本批发布引发的告警进入 / 恢复转换次数。
 
 错误码：未知来源/非法时间/空批次 → 400；字段结构错误（缺字段、`seq<0` 等）→ 422；
 同 key 不同 payload → 409；会话不存在 → 404。
@@ -140,18 +166,95 @@ curl -s 'localhost:8000/sessions/lab-1/quarantine'
 `GET /sessions/{session_id}`：返回来源列表、迟到容忍、是否已全部首报、
 已发布水位线与当前计算出的有效水位线。
 
+### 6. 创建告警规则
+
+`POST /sessions/{session_id}/alert-rules`
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
+  -H 'Content-Type: application/json' -d '{
+  "source_id": "thermometer-a",
+  "direction": "above",
+  "enter_threshold": 30.0,
+  "recover_threshold": 28.0,
+  "enter_count": 3,
+  "recover_count": 2
+}'
+```
+
+- `direction`：`above`（默认，高值告警）或 `below`（低值告警）；
+- 滞回带：`above` 要求 `recover_threshold < enter_threshold`，`below` 要求相反，否则 400；
+- `enter_count` / `recover_count`：进入 / 恢复所需的**连续**读数次数，须 ≥ 1；
+- `rule_id` 可省略（自动生成），重复时返回 409；
+- 创建时对该来源已发布读数做一次重放，响应中的 `state` 为重放后的状态、
+  `replayed_readings` 为重放条数。响应 201。
+
+错误码：未知来源 / 非法规则（滞回带、次数、direction）→ 400；会话不存在 → 404。
+
+### 7. 告警规则列表
+
+`GET /sessions/{session_id}/alert-rules`：返回会话全部规则配置（按创建时间排序）。
+
+### 8. 当前告警
+
+`GET /sessions/{session_id}/alerts/current`
+
+```json
+{
+  "session_id": "lab-1",
+  "active": 1,
+  "alerts": [
+    {
+      "rule_id": "…",
+      "source_id": "thermometer-a",
+      "direction": "above",
+      "enter_threshold": 30.0,
+      "recover_threshold": 28.0,
+      "enter_count": 3,
+      "recover_count": 2,
+      "state": "alerting",
+      "enter_streak": 0,
+      "recover_streak": 1,
+      "last_value": 29.4,
+      "last_observed_at": "2026-09-21T10:05:00Z",
+      "last_seq": 42,
+      "state_changed_at": "2026-09-21T10:02:00Z",
+      "created_at": "2026-09-21T09:00:00Z"
+    }
+  ]
+}
+```
+
+`state` 取值：`normal`（正常）、`entering`（越限计数累积中）、`alerting`（告警持续中）、
+`recovering`（恢复计数累积中，仍计为活动告警）；`active` 为当前活动告警（alerting + recovering）条数。
+
+### 9. 告警历史（分页）
+
+`GET /sessions/{session_id}/alerts/history?limit=100&cursor=...&source_id=...&rule_id=...`
+
+- 只包含状态转换事件（`entered` / `recovered`），按 `(observed_at, source_id, seq, rule_id)`
+  确定顺序排列，keyset 分页（`next_cursor` 为 `null` 表示取完）；
+- 每条事件带触发读数的 `observed_at`、`seq`、数值 `value` 与触发时的连续次数 `streak`；
+- 支持按 `source_id`、`rule_id` 过滤。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=50'
+```
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由、异常映射
-│   ├── service.py       # 水位线计算 / 发布 / 隔离 / 幂等等核心逻辑
-│   ├── database.py      # SQLite schema、连接、BEGIN IMMEDIATE 事务
-│   ├── models.py        # Pydantic 请求/响应模型
-│   ├── time_utils.py    # ISO 8601 解析与 UTC 规范化
-│   └── config.py        # 环境变量配置
-├── tests/test_api.py    # 22 个端到端行为测试
+│   ├── main.py            # FastAPI 路由、异常映射
+│   ├── service.py         # 水位线计算 / 发布 / 隔离 / 幂等 / 告警状态机
+│   ├── database.py        # SQLite schema、连接、BEGIN IMMEDIATE 事务
+│   ├── models.py          # Pydantic 请求/响应模型
+│   ├── time_utils.py      # ISO 8601 解析与 UTC 规范化
+│   └── config.py          # 环境变量配置
+├── tests/
+│   ├── test_api.py        # 时间线归并行为测试（22 个）
+│   └── test_alerts.py     # 发布后告警行为测试（19 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

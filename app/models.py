@@ -73,6 +73,8 @@ class ReportResponse(BaseModel):
     buffered: int
     all_sources_reported: bool
     published_watermark: Optional[str] = None
+    alerts_entered: int = 0
+    alerts_recovered: int = 0
 
 
 class PullResponse(BaseModel):
@@ -103,3 +105,80 @@ class CreatedSessionResponse(BaseModel):
     source_ids: list[str]
     allowed_lateness_seconds: float
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# alerting
+# ---------------------------------------------------------------------------
+
+class AlertRuleIn(BaseModel):
+    """Alert rule payload.
+
+    Value semantics (unknown source, bad hysteresis band, counts < 1) are
+    validated in the service layer so they map to a clear 400, not 422.
+    """
+
+    source_id: str = Field(..., min_length=1, description="Source of the session this rule watches")
+    direction: str = Field(
+        "above", description="'above' alerts on high values, 'below' on low values"
+    )
+    enter_threshold: float = Field(..., description="Breaching side of the hysteresis band")
+    recover_threshold: float = Field(..., description="Recovering side of the hysteresis band")
+    enter_count: int = Field(..., description="Consecutive breaching readings required to enter")
+    recover_count: int = Field(..., description="Consecutive recovering readings required to recover")
+    rule_id: Optional[str] = Field(None, min_length=1, description="Optional caller-chosen id")
+
+
+class AlertRuleOut(BaseModel):
+    rule_id: str
+    session_id: str
+    source_id: str
+    direction: str
+    enter_threshold: float
+    recover_threshold: float
+    enter_count: int
+    recover_count: int
+    created_at: str
+
+
+class CreatedAlertRuleResponse(AlertRuleOut):
+    state: str
+    replayed_readings: int
+
+
+class AlertRulesResponse(BaseModel):
+    session_id: str
+    rules: list[AlertRuleOut]
+
+
+class AlertStatusOut(AlertRuleOut):
+    state: str
+    enter_streak: int
+    recover_streak: int
+    last_value: Optional[float] = None
+    last_observed_at: Optional[str] = None
+    last_seq: Optional[int] = None
+    state_changed_at: Optional[str] = None
+
+
+class CurrentAlertsResponse(BaseModel):
+    session_id: str
+    active: int
+    alerts: list[AlertStatusOut]
+
+
+class AlertEventOut(BaseModel):
+    rule_id: str
+    source_id: str
+    event: str
+    value: Optional[float] = None
+    observed_at: str
+    seq: int
+    streak: int
+    recorded_at: str
+
+
+class AlertHistoryResponse(BaseModel):
+    session_id: str
+    next_cursor: Optional[str] = None
+    events: list[AlertEventOut]

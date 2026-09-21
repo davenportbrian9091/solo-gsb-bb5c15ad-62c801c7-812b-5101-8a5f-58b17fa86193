@@ -12,8 +12,13 @@ from . import service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
+    AlertHistoryResponse,
+    AlertRuleIn,
+    AlertRulesResponse,
     CreateSessionIn,
+    CreatedAlertRuleResponse,
     CreatedSessionResponse,
+    CurrentAlertsResponse,
     PullResponse,
     QuarantineResponse,
     ReadingIn,
@@ -32,11 +37,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
-        "publish order and late-reading quarantine."
+        "publish order, late-reading quarantine, and post-publish "
+        "consecutive-threshold alerting with hysteresis."
     ),
     lifespan=lifespan,
 )
@@ -165,3 +171,79 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+@app.post(
+    "/sessions/{session_id}/alert-rules",
+    response_model=CreatedAlertRuleResponse,
+    status_code=201,
+    tags=["alerts"],
+)
+def create_alert_rule(
+    session_id: str,
+    body: AlertRuleIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CreatedAlertRuleResponse:
+    """Create a consecutive-threshold alert rule on one source of the session.
+
+    Unknown sources and invalid rules (bad hysteresis band, counts < 1)
+    return 400. Already-published readings of the source are replayed once
+    so the state machine reflects the full published timeline.
+    """
+    result = service.create_alert_rule(
+        conn,
+        session_id,
+        source_id=body.source_id,
+        direction=body.direction,
+        enter_threshold=body.enter_threshold,
+        recover_threshold=body.recover_threshold,
+        enter_count=body.enter_count,
+        recover_count=body.recover_count,
+        rule_id=body.rule_id,
+    )
+    return CreatedAlertRuleResponse(**result)
+
+
+@app.get(
+    "/sessions/{session_id}/alert-rules",
+    response_model=AlertRulesResponse,
+    tags=["alerts"],
+)
+def list_alert_rules(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertRulesResponse:
+    """Alert rule configuration of the session."""
+    return AlertRulesResponse(**service.list_alert_rules(conn, session_id))
+
+
+@app.get(
+    "/sessions/{session_id}/alerts/current",
+    response_model=CurrentAlertsResponse,
+    tags=["alerts"],
+)
+def current_alerts(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CurrentAlertsResponse:
+    """Live per-rule state: normal / entering / alerting / recovering."""
+    return CurrentAlertsResponse(**service.get_current_alerts(conn, session_id))
+
+
+@app.get(
+    "/sessions/{session_id}/alerts/history",
+    response_model=AlertHistoryResponse,
+    tags=["alerts"],
+)
+def alert_history(
+    session_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(None, description="Opaque next_cursor from a previous page"),
+    source_id: Optional[str] = Query(None, description="Filter to one source"),
+    rule_id: Optional[str] = Query(None, description="Filter to one rule"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertHistoryResponse:
+    """Alert transition events (entered / recovered) in timeline order."""
+    return AlertHistoryResponse(
+        **service.list_alert_events(conn, session_id, limit, cursor, source_id, rule_id)
+    )

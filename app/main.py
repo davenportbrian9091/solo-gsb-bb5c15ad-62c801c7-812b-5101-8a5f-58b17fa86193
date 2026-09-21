@@ -8,12 +8,17 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import service
+from . import alerts, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
+    AlertHistoryResponse,
+    AlertRuleOut,
+    AlertRulesResponse,
+    CreateAlertRuleIn,
     CreateSessionIn,
     CreatedSessionResponse,
+    CurrentAlertsResponse,
     PullResponse,
     QuarantineResponse,
     ReadingIn,
@@ -32,11 +37,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
-        "publish order and late-reading quarantine."
+        "publish order and late-reading quarantine. Published readings also "
+        "drive per-source threshold alert state machines (enter / active / "
+        "recovered) with hysteresis and consecutive-count debouncing."
     ),
     lifespan=lifespan,
 )
@@ -165,3 +172,114 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+# ---------------------------------------------------------------------------
+# post-publish threshold alerts
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/sessions/{session_id}/alert-rules",
+    response_model=AlertRuleOut,
+    status_code=201,
+    tags=["alerts"],
+)
+def create_alert_rule(
+    session_id: str,
+    body: CreateAlertRuleIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertRuleOut:
+    """Create a per-source threshold alert rule.
+
+    The rule's state machine immediately replays the session's already
+    published readings for that source, so its initial state is independent
+    of when the rule was created.  Unknown sources and rules whose
+    enter/recover thresholds do not form a valid hysteresis band return 400.
+    """
+    result = alerts.create_rule(
+        conn,
+        session_id=session_id,
+        source_id=body.source_id,
+        direction=body.direction,
+        enter_threshold=body.enter_threshold,
+        recover_threshold=body.recover_threshold,
+        enter_consecutive=body.enter_consecutive,
+        recover_consecutive=body.recover_consecutive,
+        value_key=body.value_key,
+        rule_id=body.rule_id,
+    )
+    return AlertRuleOut(**result)
+
+
+@app.get(
+    "/sessions/{session_id}/alert-rules",
+    response_model=AlertRulesResponse,
+    tags=["alerts"],
+)
+def list_alert_rules(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertRulesResponse:
+    return AlertRulesResponse(session_id=session_id, rules=alerts.list_rules(conn, session_id))
+
+
+@app.get(
+    "/sessions/{session_id}/alert-rules/{rule_id}",
+    response_model=AlertRuleOut,
+    tags=["alerts"],
+)
+def get_alert_rule(
+    session_id: str,
+    rule_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertRuleOut:
+    return AlertRuleOut(**alerts.get_rule(conn, session_id, rule_id))
+
+
+@app.get(
+    "/sessions/{session_id}/alerts/current",
+    response_model=CurrentAlertsResponse,
+    tags=["alerts"],
+)
+def current_alerts(
+    session_id: str,
+    source_id: Optional[str] = Query(
+        None, description="Restrict to one declared source of the session"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CurrentAlertsResponse:
+    """Rules currently in the ``active`` state (entered, not yet recovered)."""
+    return CurrentAlertsResponse(
+        session_id=session_id,
+        alerts=alerts.list_current_alerts(conn, session_id, source_id),
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/alerts/history",
+    response_model=AlertHistoryResponse,
+    tags=["alerts"],
+)
+def alert_history(
+    session_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(None, description="Opaque next_cursor from a previous page"),
+    source_id: Optional[str] = Query(None, description="Filter by source"),
+    rule_id: Optional[str] = Query(None, description="Filter by rule"),
+    event_type: Optional[str] = Query(
+        None, description="Filter: 'entered' or 'recovered'"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertHistoryResponse:
+    """Entered/recovered events, newest first, with keyset pagination."""
+    if event_type is not None and event_type not in alerts.EVENT_TYPES:
+        return _error(
+            400,
+            f"event_type must be one of {list(alerts.EVENT_TYPES)},"
+            f" got {event_type!r}",
+        )
+    return AlertHistoryResponse(
+        **alerts.list_event_history(
+            conn, session_id, limit, cursor, source_id, rule_id, event_type
+        )
+    )

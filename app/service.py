@@ -17,31 +17,32 @@ Guarantees implemented here:
 """
 from __future__ import annotations
 
-import base64
 import json
 import sqlite3
 import uuid
 from datetime import timedelta
 from typing import Any, Optional
 
+from .cursor import decode_cursor as _decode_cursor
+from .cursor import encode_cursor as _encode_cursor
 from .database import read_transaction, transaction, utc_now
+from .errors import BadRequestError, ConflictError, NotFoundError, ServiceError
 from .time_utils import format_event_time, parse_event_time, store_event_time
 
-
-class ServiceError(Exception):
-    """Base class for expected service failures mapped to HTTP errors."""
-
-
-class NotFoundError(ServiceError):
-    status_code = 404
-
-
-class BadRequestError(ServiceError):
-    status_code = 400
-
-
-class ConflictError(ServiceError):
-    status_code = 409
+# Re-exported so existing imports (``app.service.ServiceError`` etc.) keep
+# working; the canonical definitions live in :mod:`app.errors`.
+__all__ = [
+    "ServiceError",
+    "NotFoundError",
+    "BadRequestError",
+    "ConflictError",
+    "canonical_payload",
+    "create_session",
+    "get_session",
+    "ingest_batch",
+    "list_published",
+    "list_quarantined",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -88,22 +89,6 @@ def _compute_watermark(
         return None
     slowest = parse_event_time(min(source_max.values()))  # type: ignore[arg-type]
     return store_event_time(slowest - timedelta(seconds=allowed_lateness_seconds))
-
-
-def _encode_cursor(parts: tuple) -> str:
-    raw = json.dumps(parts, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _decode_cursor(cursor: str, expected: int) -> tuple:
-    try:
-        padding = "=" * (-len(cursor) % 4)
-        parts = tuple(json.loads(base64.urlsafe_b64decode(cursor + padding)))
-    except Exception as exc:  # malformed base64 / json
-        raise BadRequestError("malformed cursor") from exc
-    if len(parts) != expected:
-        raise BadRequestError("malformed cursor")
-    return parts
 
 
 def _reading_out(row: sqlite3.Row) -> dict[str, Any]:
@@ -290,6 +275,14 @@ def ingest_batch(
                 (new_wm, session_id),
             )
             published_wm = new_wm
+            if published_now:
+                # Deterministically-published readings are the *only* input to
+                # the per-source alert state machines; buffered readings that
+                # merely became published in this batch drive it, in timeline
+                # order, inside the same serialised write transaction.
+                from .alerts import advance_alerts
+
+                advance_alerts(conn, session_id, new_wm, received_at)
 
         published_total = conn.execute(
             "SELECT COUNT(*) AS c FROM readings WHERE session_id = ? AND status = 'published'",
